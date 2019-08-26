@@ -1,0 +1,1096 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "name": "dl2_fastai_lec11.ipynb",
+      "version": "0.3.2",
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "_GvvjBMmZXaT",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "from pathlib import Path\n",
+        "from IPython.core.debugger import set_trace\n",
+        "from fastai import datasets\n",
+        "import pickle, gzip, math, torch, matplotlib as mpl\n",
+        "import matplotlib.pyplot as plt\n",
+        "from torch import tensor\n",
+        "import operator\n",
+        "from torch.nn import init\n",
+        "from torch import nn\n",
+        "import torch.nn.functional as F\n",
+        "from functools import partial\n",
+        "from torch import optim\n",
+        "\n",
+        "MNIST_URL='http://deeplearning.net/data/mnist/mnist.pkl'\n",
+        "\n",
+        "\n",
+        "def test(a,b,cmp,cname=None):\n",
+        "    if cname is None: cname=cmp.__name__\n",
+        "    assert cmp(a,b),f\"{cname}:\\n{a}\\n{b}\"\n",
+        "\n",
+        "def test_eq(a,b): test(a,b,operator.eq,'==')\n",
+        "\n",
+        "def near(a,b): return torch.allclose(a, b, rtol=1e-3, atol=1e-5)\n",
+        "\n",
+        "def test_near(a,b): test(a,b,near)  \n",
+        "  \n",
+        "def get_data():\n",
+        "    path = datasets.download_data(MNIST_URL, ext='.gz')\n",
+        "    with gzip.open(path, 'rb') as f:\n",
+        "        ((x_train, y_train), (x_valid, y_valid), _) = pickle.load(f, encoding='latin-1')\n",
+        "    return map(tensor, (x_train,y_train,x_valid,y_valid))\n",
+        "\n",
+        "def normalize(x, m, s): return (x-m)/s\n",
+        "\n",
+        "def test_near_zero(a,tol=1e-3): assert a.abs()<tol, f\"Near zero: {a}\"\n",
+        "  \n",
+        "def mse(output, targ): return (output.squeeze(-1) - targ).pow(2).mean()\n",
+        "\n",
+        "class Dataset():\n",
+        "    def __init__(self, x, y): self.x,self.y = x,y\n",
+        "    def __len__(self): return len(self.x)\n",
+        "    def __getitem__(self,i): return self.x[i],self.y[i]\n",
+        "\n",
+        "from torch.utils.data import DataLoader, SequentialSampler, RandomSampler\n",
+        "\n",
+        "def get_dls(train_ds, valid_ds, bs, **kwargs):\n",
+        "    return (DataLoader(train_ds, batch_size=bs, shuffle=True, **kwargs),\n",
+        "        DataLoader(valid_ds, batch_size=bs*2, **kwargs))\n",
+        "    \n",
+        "class DataBunch():\n",
+        "    def __init__(self, train_dl, valid_dl, c=None):\n",
+        "        self.train_dl,self.valid_dl,self.c = train_dl,valid_dl,c\n",
+        "        \n",
+        "    @property\n",
+        "    def train_ds(self): return self.train_dl.dataset\n",
+        "        \n",
+        "    @property\n",
+        "    def valid_ds(self): return self.valid_dl.dataset\n",
+        "\n",
+        "def get_model(data, lr=0.5, nh=50):\n",
+        "    m = data.train_ds.x.shape[1]\n",
+        "    model = nn.Sequential(nn.Linear(m,nh), nn.ReLU(), nn.Linear(nh,data.c))\n",
+        "    return model, optim.SGD(model.parameters(), lr=lr)\n",
+        "\n",
+        "class Learner():\n",
+        "    def __init__(self, model, opt, loss_func, data):\n",
+        "        self.model,self.opt,self.loss_func,self.data = model,opt,loss_func,data\n",
+        "\n",
+        "import re\n",
+        "\n",
+        "_camel_re1 = re.compile('(.)([A-Z][a-z]+)')\n",
+        "_camel_re2 = re.compile('([a-z0-9])([A-Z])')\n",
+        "\n",
+        "def camel2snake(name):\n",
+        "    s1 = re.sub(_camel_re1, r'\\1_\\2', name)\n",
+        "    return re.sub(_camel_re2, r'\\1_\\2', s1).lower()\n",
+        "\n",
+        "def combine_scheds(pcts, scheds):\n",
+        "    assert sum(pcts) == 1.\n",
+        "    pcts = tensor([0] + listify(pcts))\n",
+        "    assert torch.all(pcts >= 0)\n",
+        "    pcts = torch.cumsum(pcts, 0)\n",
+        "    def _inner(pos):\n",
+        "        idx = (pos >= pcts).nonzero().max()\n",
+        "        actual_pos = (pos-pcts[idx]) / (pcts[idx+1]-pcts[idx])\n",
+        "        return scheds[idx](actual_pos)\n",
+        "    return _inner\n",
+        "  \n",
+        "class Callback():\n",
+        "    _order=0\n",
+        "    def set_runner(self, run): self.run = run\n",
+        "    def __getattr__(self, k): return getattr(self.run, k)\n",
+        "    \n",
+        "    @property \n",
+        "    def name(self):\n",
+        "      name = re.sub(r'Callback$','', self.__class__.__name__)\n",
+        "      return camel2snake(name or 'callback')\n",
+        "\n",
+        "from typing import *\n",
+        "\n",
+        "def listify(o):\n",
+        "    if o is None: return []\n",
+        "    if isinstance(o, list): return o\n",
+        "    if isinstance(o, Iterable): return list(o)\n",
+        "    return [o]\n",
+        "\n",
+        "class AvgStats():\n",
+        "  def __init__(self, metrics, in_train): self.metrics, self.in_train = listify(metrics), in_train\n",
+        "    \n",
+        "  def reset(self):\n",
+        "    self.tot_loss, self.count = 0., 0\n",
+        "    self.tot_mets = [0.]*len(self.metrics)\n",
+        "    \n",
+        "  @property\n",
+        "  def all_stats(self): return [self.tot_loss.item()] + self.tot_mets\n",
+        "  \n",
+        "  @property\n",
+        "  def avg_stats(self): return [o/self.count for o in self.all_stats]\n",
+        "  \n",
+        "  def __repr__(self):\n",
+        "    if not self.count: return \"\"\n",
+        "    return f\"{'train' if self.in_train else 'valid'}: {self.avg_stats}\"\n",
+        "  \n",
+        "  def accumulate(self, run):\n",
+        "    bn = run.xb.shape[0]\n",
+        "    self.tot_loss += run.loss*bn\n",
+        "    self.count += bn\n",
+        "    for i,m in enumerate(self.metrics):\n",
+        "      self.tot_mets[i] += m(run.pred, run.yb)*bn\n",
+        "      \n",
+        "class AvgStatsCallback(Callback):\n",
+        "    def __init__(self, metrics):\n",
+        "        self.train_stats,self.valid_stats = AvgStats(metrics,True),AvgStats(metrics,False)\n",
+        "        \n",
+        "    def begin_epoch(self):\n",
+        "        self.train_stats.reset()\n",
+        "        self.valid_stats.reset()\n",
+        "        \n",
+        "    def after_loss(self):\n",
+        "        stats = self.train_stats if self.in_train else self.valid_stats\n",
+        "        with torch.no_grad(): stats.accumulate(self.run)\n",
+        "    \n",
+        "    def after_epoch(self):\n",
+        "        print(self.train_stats)\n",
+        "        print(self.valid_stats)\n",
+        "\n",
+        "def create_learner(model_func, loss_func, data):\n",
+        "    return Learner(*model_func(data), loss_func, data)\n",
+        "\n",
+        "def get_model_func(lr=0.5): return partial(get_model, lr=lr)\n",
+        "\n",
+        "class Recorder(Callback):\n",
+        "    def begin_fit(self): self.lrs,self.losses = [],[]\n",
+        "\n",
+        "    def after_batch(self):\n",
+        "        if not self.in_train: return\n",
+        "        self.lrs.append(self.opt.param_groups[-1]['lr'])\n",
+        "        self.losses.append(self.loss.detach().cpu())        \n",
+        "\n",
+        "    def plot_lr  (self): plt.plot(self.lrs)\n",
+        "    def plot_loss(self): plt.plot(self.losses)\n",
+        "\n",
+        "class ParamScheduler(Callback):\n",
+        "    _order=1\n",
+        "    def __init__(self, pname, sched_func): self.pname,self.sched_func = pname,sched_func\n",
+        "\n",
+        "    def set_param(self):\n",
+        "        for pg in self.opt.param_groups:\n",
+        "            pg[self.pname] = self.sched_func(self.n_epochs/self.epochs)\n",
+        "            \n",
+        "    def begin_batch(self): \n",
+        "        if self.in_train: self.set_param()\n",
+        "\n",
+        "def annealer(f):\n",
+        "    def _inner(start, end): return partial(f, start, end)\n",
+        "    return _inner\n",
+        "\n",
+        "@annealer\n",
+        "def sched_lin(start, end, pos): return start + pos*(end-start)\n",
+        "\n",
+        "@annealer\n",
+        "def sched_cos(start, end, pos): return start + (1 + math.cos(math.pi*(1-pos))) * (end-start) / 2\n",
+        "@annealer\n",
+        "def sched_no(start, end, pos):  return start\n",
+        "@annealer\n",
+        "def sched_exp(start, end, pos): return start * (end/start) ** pos\n",
+        "\n",
+        "def accuracy(out, yb): return (torch.argmax(out, dim=1)==yb).float().mean()\n",
+        "\n",
+        "#This monkey-patch is there to be able to plot tensors\n",
+        "torch.Tensor.ndim = property(lambda x: len(x.shape))\n",
+        "\n",
+        "\n",
+        "#export\n",
+        "class Callback():\n",
+        "    _order=0\n",
+        "    def set_runner(self, run): self.run=run\n",
+        "    def __getattr__(self, k): return getattr(self.run, k)\n",
+        "    \n",
+        "    @property\n",
+        "    def name(self):\n",
+        "        name = re.sub(r'Callback$', '', self.__class__.__name__)\n",
+        "        return camel2snake(name or 'callback')\n",
+        "    \n",
+        "    def __call__(self, cb_name):\n",
+        "        f = getattr(self, cb_name, None)\n",
+        "        if f and f(): return True\n",
+        "        return False\n",
+        "\n",
+        "class TrainEvalCallback(Callback):\n",
+        "    def begin_fit(self):\n",
+        "        self.run.n_epochs=0.\n",
+        "        self.run.n_iter=0\n",
+        "    \n",
+        "    def after_batch(self):\n",
+        "        if not self.in_train: return\n",
+        "        self.run.n_epochs += 1./self.iters\n",
+        "        self.run.n_iter   += 1\n",
+        "        \n",
+        "    def begin_epoch(self):\n",
+        "        self.run.n_epochs=self.epoch\n",
+        "        self.model.train()\n",
+        "        self.run.in_train=True\n",
+        "\n",
+        "    def begin_validate(self):\n",
+        "        self.model.eval()\n",
+        "        self.run.in_train=False\n",
+        "\n",
+        "class CancelTrainException(Exception): pass\n",
+        "class CancelEpochException(Exception): pass\n",
+        "class CancelBatchException(Exception): pass\n",
+        "\n",
+        "#export\n",
+        "class Runner():\n",
+        "    def __init__(self, cbs=None, cb_funcs=None):\n",
+        "        cbs = listify(cbs)\n",
+        "        for cbf in listify(cb_funcs):\n",
+        "            cb = cbf()\n",
+        "            setattr(self, cb.name, cb)\n",
+        "            cbs.append(cb)\n",
+        "        self.stop,self.cbs = False,[TrainEvalCallback()]+cbs\n",
+        "\n",
+        "    @property\n",
+        "    def opt(self):       return self.learn.opt\n",
+        "    @property\n",
+        "    def model(self):     return self.learn.model\n",
+        "    @property\n",
+        "    def loss_func(self): return self.learn.loss_func\n",
+        "    @property\n",
+        "    def data(self):      return self.learn.data\n",
+        "\n",
+        "    def one_batch(self, xb, yb):\n",
+        "        try:\n",
+        "            self.xb,self.yb = xb,yb\n",
+        "            self('begin_batch')\n",
+        "            self.pred = self.model(self.xb)\n",
+        "            self('after_pred')\n",
+        "            self.loss = self.loss_func(self.pred, self.yb)\n",
+        "            self('after_loss')\n",
+        "            if not self.in_train: return\n",
+        "            self.loss.backward()\n",
+        "            self('after_backward')\n",
+        "            self.opt.step()\n",
+        "            self('after_step')\n",
+        "            self.opt.zero_grad()\n",
+        "        except CancelBatchException: self('after_cancel_batch')\n",
+        "        finally: self('after_batch')\n",
+        "\n",
+        "    def all_batches(self, dl):\n",
+        "        self.iters = len(dl)\n",
+        "        try:\n",
+        "            for xb,yb in dl: self.one_batch(xb, yb)\n",
+        "        except CancelEpochException: self('after_cancel_epoch')\n",
+        "\n",
+        "    def fit(self, epochs, learn):\n",
+        "        self.epochs,self.learn,self.loss = epochs,learn,tensor(0.)\n",
+        "\n",
+        "        try:\n",
+        "            for cb in self.cbs: cb.set_runner(self)\n",
+        "            self('begin_fit')\n",
+        "            for epoch in range(epochs):\n",
+        "                self.epoch = epoch\n",
+        "                if not self('begin_epoch'): self.all_batches(self.data.train_dl)\n",
+        "\n",
+        "                with torch.no_grad(): \n",
+        "                    if not self('begin_validate'): self.all_batches(self.data.valid_dl)\n",
+        "                self('after_epoch')\n",
+        "            \n",
+        "        except CancelTrainException: self('after_cancel_train')\n",
+        "        finally:\n",
+        "            self('after_fit')\n",
+        "            self.learn = None\n",
+        "\n",
+        "    def __call__(self, cb_name):\n",
+        "        res = False\n",
+        "        for cb in sorted(self.cbs, key=lambda x: x._order): res = cb(cb_name) and res\n",
+        "        return res\n",
+        "\n",
+        "        #export\n",
+        "class AvgStatsCallback(Callback):\n",
+        "    def __init__(self, metrics):\n",
+        "        self.train_stats,self.valid_stats = AvgStats(metrics,True),AvgStats(metrics,False)\n",
+        "        \n",
+        "    def begin_epoch(self):\n",
+        "        self.train_stats.reset()\n",
+        "        self.valid_stats.reset()\n",
+        "        \n",
+        "    def after_loss(self):\n",
+        "        stats = self.train_stats if self.in_train else self.valid_stats\n",
+        "        with torch.no_grad(): stats.accumulate(self.run)\n",
+        "    \n",
+        "    def after_epoch(self):\n",
+        "        print(self.train_stats)\n",
+        "        print(self.valid_stats)\n",
+        "        \n",
+        "class Recorder(Callback):\n",
+        "    def begin_fit(self):\n",
+        "        self.lrs = [[] for _ in self.opt.param_groups]\n",
+        "        self.losses = []\n",
+        "\n",
+        "    def after_batch(self):\n",
+        "        if not self.in_train: return\n",
+        "        for pg,lr in zip(self.opt.param_groups,self.lrs): lr.append(pg['lr'])\n",
+        "        self.losses.append(self.loss.detach().cpu())        \n",
+        "\n",
+        "    def plot_lr  (self, pgid=-1): plt.plot(self.lrs[pgid])\n",
+        "    def plot_loss(self, skip_last=0): plt.plot(self.losses[:len(self.losses)-skip_last])\n",
+        "        \n",
+        "    def plot(self, skip_last=0, pgid=-1):\n",
+        "        losses = [o.item() for o in self.losses]\n",
+        "        lrs    = self.lrs[pgid]\n",
+        "        n = len(losses)-skip_last\n",
+        "        plt.xscale('log')\n",
+        "        plt.plot(lrs[:n], losses[:n])\n",
+        "\n",
+        "class ParamScheduler(Callback):\n",
+        "    _order=1\n",
+        "    def __init__(self, pname, sched_funcs): self.pname,self.sched_funcs = pname,sched_funcs\n",
+        "        \n",
+        "    def begin_fit(self):\n",
+        "        if not isinstance(self.sched_funcs, (list,tuple)):\n",
+        "            self.sched_funcs = [self.sched_funcs] * len(self.opt.param_groups)\n",
+        "\n",
+        "    def set_param(self):\n",
+        "        assert len(self.opt.param_groups)==len(self.sched_funcs)\n",
+        "        for pg,f in zip(self.opt.param_groups,self.sched_funcs):\n",
+        "            pg[self.pname] = f(self.n_epochs/self.epochs)\n",
+        "            \n",
+        "    def begin_batch(self): \n",
+        "        if self.in_train: self.set_param()\n",
+        "\n",
+        "        \n",
+        "#export\n",
+        "def normalize_to(train, valid):\n",
+        "    m,s = train.mean(),train.std()\n",
+        "    return normalize(train, m, s), normalize(valid, m, s)\n",
+        "\n",
+        "\n",
+        "    #export\n",
+        "class Lambda(nn.Module):\n",
+        "    def __init__(self, func):\n",
+        "        super().__init__()\n",
+        "        self.func = func\n",
+        "\n",
+        "    def forward(self, x): return self.func(x)\n",
+        "\n",
+        "def flatten(x):      return x.view(x.shape[0], -1)\n",
+        "\n",
+        "class CudaCallback(Callback):\n",
+        "    def begin_fit(self): self.model.cuda()\n",
+        "    def begin_batch(self): self.run.xb,self.run.yb = self.xb.cuda(),self.yb.cuda()\n",
+        "\n",
+        "\n",
+        "class BatchTransformXCallback(Callback):\n",
+        "    _order=2\n",
+        "    def __init__(self, tfm): self.tfm = tfm\n",
+        "    def begin_batch(self): self.run.xb = self.tfm(self.xb)\n",
+        "\n",
+        "def view_tfm(*size):\n",
+        "    def _inner(x): return x.view(*((-1,)+size))\n",
+        "    return _inner\n",
+        "\n",
+        "def get_runner(model, data, lr=0.6, cbs=None, opt_func=None, loss_func = F.cross_entropy):\n",
+        "    if opt_func is None: opt_func = optim.SGD\n",
+        "    opt = opt_func(model.parameters(), lr=lr)\n",
+        "    learn = Learner(model, opt, loss_func, data)\n",
+        "    return learn, Runner(cb_funcs=listify(cbs))\n",
+        "\n",
+        "def children(m): return list(m.children())\n",
+        "\n",
+        "class Hook():\n",
+        "    def __init__(self, m, f): self.hook = m.register_forward_hook(partial(f, self))\n",
+        "    def remove(self): self.hook.remove()\n",
+        "    def __del__(self): self.remove()\n",
+        "\n",
+        "def append_stats(hook, mod, inp, outp):\n",
+        "    if not hasattr(hook,'stats'): hook.stats = ([],[])\n",
+        "    means,stds = hook.stats\n",
+        "    means.append(outp.data.mean())\n",
+        "    stds .append(outp.data.std())\n",
+        "\n",
+        "\n",
+        "class ListContainer():\n",
+        "    def __init__(self, items): self.items = listify(items)\n",
+        "    def __getitem__(self, idx):\n",
+        "        if isinstance(idx, (int,slice)): return self.items[idx]\n",
+        "        if isinstance(idx[0],bool):\n",
+        "            assert len(idx)==len(self) # bool mask\n",
+        "            return [o for m,o in zip(idx,self.items) if m]\n",
+        "        return [self.items[i] for i in idx]\n",
+        "    def __len__(self): return len(self.items)\n",
+        "    def __iter__(self): return iter(self.items)\n",
+        "    def __setitem__(self, i, o): self.items[i] = o\n",
+        "    def __delitem__(self, i): del(self.items[i])\n",
+        "    def __repr__(self):\n",
+        "        res = f'{self.__class__.__name__} ({len(self)} items)\\n{self.items[:10]}'\n",
+        "        if len(self)>10: res = res[:-1]+ '...]'\n",
+        "        return res\n",
+        "\n",
+        "#export\n",
+        "from torch.nn import init\n",
+        "\n",
+        "class Hooks(ListContainer):\n",
+        "    def __init__(self, ms, f): super().__init__([Hook(m, f) for m in ms])\n",
+        "    def __enter__(self, *args): return self\n",
+        "    def __exit__ (self, *args): self.remove()\n",
+        "    def __del__(self): self.remove()\n",
+        "\n",
+        "    def __delitem__(self, i):\n",
+        "        self[i].remove()\n",
+        "        super().__delitem__(i)\n",
+        "        \n",
+        "    def remove(self):\n",
+        "        for h in self: h.remove()\n",
+        "\n",
+        "def get_cnn_layers(data, nfs, layer, **kwargs):\n",
+        "    nfs = [1] + nfs\n",
+        "    return [layer(nfs[i], nfs[i+1], 5 if i==0 else 3, **kwargs)\n",
+        "            for i in range(len(nfs)-1)] + [\n",
+        "        nn.AdaptiveAvgPool2d(1), Lambda(flatten), nn.Linear(nfs[-1], data.c)]\n",
+        "\n",
+        "def conv_layer(ni, nf, ks=3, stride=2, **kwargs):\n",
+        "    return nn.Sequential(\n",
+        "        nn.Conv2d(ni, nf, ks, padding=ks//2, stride=stride), GeneralRelu(**kwargs))\n",
+        "\n",
+        "class GeneralRelu(nn.Module):\n",
+        "    def __init__(self, leak=None, sub=None, maxv=None):\n",
+        "        super().__init__()\n",
+        "        self.leak,self.sub,self.maxv = leak,sub,maxv\n",
+        "\n",
+        "    def forward(self, x): \n",
+        "        x = F.leaky_relu(x,self.leak) if self.leak is not None else F.relu(x)\n",
+        "        if self.sub is not None: x.sub_(self.sub)\n",
+        "        if self.maxv is not None: x.clamp_max_(self.maxv)\n",
+        "        return x\n",
+        "\n",
+        "def init_cnn(m, uniform=False):\n",
+        "    f = init.kaiming_uniform_ if uniform else init.kaiming_normal_\n",
+        "    for l in m:\n",
+        "        if isinstance(l, nn.Sequential):\n",
+        "            f(l[0].weight, a=0.1)\n",
+        "            l[0].bias.data.zero_()\n",
+        "\n",
+        "def get_cnn_model(data, nfs, layer, **kwargs):\n",
+        "    return nn.Sequential(*get_cnn_layers(data, nfs, layer, **kwargs))\n",
+        "\n",
+        "def get_learn_run(nfs, data, lr, layer, cbs=None, opt_func=None, uniform=False, **kwargs):\n",
+        "    model = get_cnn_model(data, nfs, layer, **kwargs)\n",
+        "    init_cnn(model, uniform=uniform)\n",
+        "    return get_runner(model, data, lr=lr, cbs=cbs, opt_func=opt_func)\n",
+        "\n",
+        "#export\n",
+        "from IPython.display import display, Javascript\n",
+        "def nb_auto_export():\n",
+        "    display(Javascript(\"\"\"{\n",
+        "const ip = IPython.notebook\n",
+        "if (ip) {\n",
+        "    ip.save_notebook()\n",
+        "    console.log('a')\n",
+        "    const s = `!python notebook2script.py ${ip.notebook_name}`\n",
+        "    if (ip.kernel) { ip.kernel.execute(s) }\n",
+        "}\n",
+        "}\"\"\"))\n",
+        "\n",
+        "#export\n",
+        "def init_cnn_(m, f):\n",
+        "    if isinstance(m, nn.Conv2d):\n",
+        "        f(m.weight, a=0.1)\n",
+        "        if getattr(m, 'bias', None) is not None: m.bias.data.zero_()\n",
+        "    for l in m.children(): init_cnn_(l, f)\n",
+        "\n",
+        "def init_cnn(m, uniform=False):\n",
+        "    f = init.kaiming_uniform_ if uniform else init.kaiming_normal_\n",
+        "    init_cnn_(m, f)\n",
+        "\n",
+        "def get_learn_run(nfs, data, lr, layer, cbs=None, opt_func=None, uniform=False, **kwargs):\n",
+        "    model = get_cnn_model(data, nfs, layer, **kwargs)\n",
+        "    init_cnn(model, uniform=uniform)\n",
+        "    return get_runner(model, data, lr=lr, cbs=cbs, opt_func=opt_func)\n",
+        "\n",
+        "\n",
+        "#export\n",
+        "def conv_layer(ni, nf, ks=3, stride=2, bn=True, **kwargs):\n",
+        "    layers = [nn.Conv2d(ni, nf, ks, padding=ks//2, stride=stride, bias=not bn),\n",
+        "              GeneralRelu(**kwargs)]\n",
+        "    if bn: layers.append(nn.BatchNorm2d(nf, eps=1e-5, momentum=0.1))\n",
+        "    return nn.Sequential(*layers)"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "y-54IhFCZGhL",
+        "colab_type": "text"
+      },
+      "source": [
+        "# Layerwise Sequential Unit Variance (LSUV)\n",
+        "\n",
+        "\n",
+        "Getting the MNIST data and a CNN"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "I53ADmGfZDjK",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "x_train,y_train,x_valid,y_valid = get_data()\n",
+        "\n",
+        "x_train,x_valid = normalize_to(x_train,x_valid)\n",
+        "train_ds,valid_ds = Dataset(x_train, y_train),Dataset(x_valid, y_valid)\n",
+        "\n",
+        "nh,bs = 50,512\n",
+        "c = y_train.max().item()+1\n",
+        "loss_func = F.cross_entropy\n",
+        "\n",
+        "data = DataBunch(*get_dls(train_ds, valid_ds, bs), c)"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "3LDN5jdTcH3r",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "mnist_view = view_tfm(1,28,28)\n",
+        "cbfs = [Recorder,\n",
+        "        partial(AvgStatsCallback,accuracy),\n",
+        "        CudaCallback,\n",
+        "        partial(BatchTransformXCallback, mnist_view)]"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "KGztDwMOcOME",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "nfs = [8,16,32,64,64]"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "yfkV4TIpcRPe",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "class ConvLayer(nn.Module):\n",
+        "    def __init__(self, ni, nf, ks=3, stride=2, sub=0., **kwargs):\n",
+        "        super().__init__()\n",
+        "        self.conv = nn.Conv2d(ni, nf, ks, padding=ks//2, stride=stride, bias=True)\n",
+        "        self.relu = GeneralRelu(sub=sub, **kwargs)\n",
+        "    \n",
+        "    def forward(self, x): return self.relu(self.conv(x))\n",
+        "    \n",
+        "    @property\n",
+        "    def bias(self): return -self.relu.sub\n",
+        "    @bias.setter\n",
+        "    def bias(self,v): self.relu.sub = -v\n",
+        "    @property\n",
+        "    def weight(self): return self.conv.weight"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "uIvy9F-kcmsj",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "learn,run = get_learn_run(nfs, data, 0.6, ConvLayer, cbs=cbfs)"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "kKPfIUfGpVvd",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "#export\n",
+        "def get_batch(dl, run):\n",
+        "    run.xb,run.yb = next(iter(dl))\n",
+        "    for cb in run.cbs: cb.set_runner(run)\n",
+        "    run('begin_batch')\n",
+        "    return run.xb,run.yb"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "Mo0yDJg_pYM0",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "xb,yb = get_batch(data.train_dl, run)"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "3j3S1jUFpbJt",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "#export\n",
+        "def find_modules(m, cond):\n",
+        "    if cond(m): return [m]\n",
+        "    return sum([find_modules(o,cond) for o in m.children()], [])\n",
+        "\n",
+        "def is_lin_layer(l):\n",
+        "    lin_layers = (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear, nn.ReLU)\n",
+        "    return isinstance(l, lin_layers)"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "eSoWvXAKpkqC",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "mods = find_modules(learn.model, lambda o: isinstance(o,ConvLayer))"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "ldq5tFjDpnE4",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 289
+        },
+        "outputId": "5035a593-bafe-439d-f71b-98327ff76757"
+      },
+      "source": [
+        "mods"
+      ],
+      "execution_count": 16,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "[ConvLayer(\n",
+              "   (conv): Conv2d(1, 8, kernel_size=(5, 5), stride=(2, 2), padding=(2, 2))\n",
+              "   (relu): GeneralRelu()\n",
+              " ), ConvLayer(\n",
+              "   (conv): Conv2d(8, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))\n",
+              "   (relu): GeneralRelu()\n",
+              " ), ConvLayer(\n",
+              "   (conv): Conv2d(16, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))\n",
+              "   (relu): GeneralRelu()\n",
+              " ), ConvLayer(\n",
+              "   (conv): Conv2d(32, 64, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))\n",
+              "   (relu): GeneralRelu()\n",
+              " ), ConvLayer(\n",
+              "   (conv): Conv2d(64, 64, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))\n",
+              "   (relu): GeneralRelu()\n",
+              " )]"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 16
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "QG2ThAGrptJF",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "def append_stat(hook, mod, inp, outp):\n",
+        "    d = outp.data\n",
+        "    hook.mean,hook.std = d.mean().item(),d.std().item()"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "9TC7WGJLpzAV",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "mdl = learn.model.cuda()"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "LNV39bHap09L",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 102
+        },
+        "outputId": "193d4475-d372-4ab7-e3e6-710db87534bc"
+      },
+      "source": [
+        "with Hooks(mods, append_stat) as hooks:\n",
+        "    mdl(xb)\n",
+        "    for hook in hooks: print(hook.mean,hook.std)"
+      ],
+      "execution_count": 19,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "text": [
+            "0.39855605363845825 0.7609114646911621\n",
+            "0.469653844833374 0.8324100375175476\n",
+            "0.35733306407928467 0.682283878326416\n",
+            "0.4266016483306885 0.6722221374511719\n",
+            "0.2745187282562256 0.43586453795433044\n"
+          ],
+          "name": "stdout"
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "wFncLSpwcoN6",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "def lsuv_module(m, xb):\n",
+        "    h = Hook(m, append_stat)\n",
+        "    \n",
+        "    while mdl(xb) is not None and abs(h.mean)  > 1e-3: m.bias -= h.mean\n",
+        "    while mdl(xb) is not None and abs(h.std-1) > 1e-3: m.weight.data /= h.std\n",
+        "\n",
+        "    \n",
+        "    mdl(xb)\n",
+        "    if(abs(h.mean)  > 1e-2 or abs(h.std-1) > 1e-3):\n",
+        "        h.remove()\n",
+        "        lsuv_module(m, xb)\n",
+        "    h.remove()\n",
+        "    return h.mean,h.std"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "RkvFK_ExpJ1l",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 102
+        },
+        "outputId": "ed190076-ef8a-408b-a1f7-ae26f118cd22"
+      },
+      "source": [
+        "for m in mods: print(lsuv_module(m, xb))"
+      ],
+      "execution_count": 21,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "text": [
+            "(0.12523163855075836, 0.9999998807907104)\n",
+            "(0.03361392393708229, 0.9999998211860657)\n",
+            "(0.15920141339302063, 0.9999999403953552)\n",
+            "(0.14456936717033386, 1.0000001192092896)\n",
+            "(0.28878772258758545, 1.0)\n"
+          ],
+          "name": "stdout"
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "HqvHKQT4E2mX",
+        "colab_type": "text"
+      },
+      "source": [
+        "\n",
+        "## Data block API foundations"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "7hjaZ_SlpO2X",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 34
+        },
+        "outputId": "a98a0646-b663-4afe-ad81-86f90a1e27a1"
+      },
+      "source": [
+        "datasets.URLs.IMAGENETTE_160"
+      ],
+      "execution_count": 22,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "'https://s3.amazonaws.com/fast-ai-imageclas/imagenette-160'"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 22
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "6D2R83MeFNBc",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 34
+        },
+        "outputId": "5f8e3af6-a66f-4ee4-8a84-c82dbebfcc66"
+      },
+      "source": [
+        "path = datasets.untar_data(datasets.URLs.IMAGENETTE_160)\n",
+        "path"
+      ],
+      "execution_count": 24,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "PosixPath('/root/.fastai/data/imagenette-160')"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 24
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "FwSNP4LIFSBD",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "import PIL,os,mimetypes\n",
+        "Path.ls = lambda x: list(x.iterdir())"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "s0M1D6haWXi6",
+        "colab_type": "text"
+      },
+      "source": [
+        ""
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "v6T7P51uFXND",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 51
+        },
+        "outputId": "6567dfee-f34e-4cf8-86d3-a7c17bca9207"
+      },
+      "source": [
+        "path.ls()"
+      ],
+      "execution_count": 26,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "[PosixPath('/root/.fastai/data/imagenette-160/train'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val')]"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 26
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "hcaN6_gxI8Kt",
+        "colab_type": "text"
+      },
+      "source": [
+        "only contains 10 classes as shown below"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "TVDeNMM6FnTb",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 187
+        },
+        "outputId": "7a056339-17fe-46db-e089-e36ed0e25a73"
+      },
+      "source": [
+        "(path/'val').ls()"
+      ],
+      "execution_count": 27,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "[PosixPath('/root/.fastai/data/imagenette-160/val/n03888257'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n01440764'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03417042'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03028079'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n02979186'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n02102040'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03394916'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03425413'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03000684'),\n",
+              " PosixPath('/root/.fastai/data/imagenette-160/val/n03445777')]"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 27
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "T96kzuQOFqoq",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "path_tench = path/'val'/'n01440764'"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "SnXYuWNcGKgL",
+        "colab_type": "code",
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 34
+        },
+        "outputId": "9fec1df8-8e79-4911-b416-70d2846250cd"
+      },
+      "source": [
+        "len(path_tench.ls())"
+      ],
+      "execution_count": 30,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "50"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 30
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "06T8e2J6Fuwj",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "img_fn = path_tench.ls()[0]\n",
+        "img_fn"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    }
+  ]
+}
